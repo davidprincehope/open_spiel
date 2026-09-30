@@ -37,6 +37,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -82,6 +83,14 @@ except RuntimeError:
 
 # Time to wait for processes to join.
 JOIN_WAIT_DELAY = 0.001
+_STOP_REQUESTED = False
+
+
+def _request_stop(signum, frame):
+  del signum, frame
+  global _STOP_REQUESTED
+  _STOP_REQUESTED = True
+  print("Stop requested: finishing the learner round and saving a training snapshot.", flush=True)
 
 
 @chex.dataclass(frozen=True)
@@ -156,6 +165,13 @@ class Config:
   quiet: bool
 
   nn_api_version: str = "nnx"
+  resume_checkpoint_freq: int = 10
+  resume_snapshot: str = ""
+  session_id: str = ""
+  log_path: str = ""
+  evaluation_games: int = 100
+  evaluation_opponent: Any = None
+  evaluation_seed: int = 0
 
 
 def _init_model_from_config(config: Config):
@@ -179,9 +195,11 @@ def watcher(fn):
   def _watcher(*, config, num=None, **kwargs):
     """Wrap the decorated function."""
     name = fn.__name__
+    if name in ("actor", "evaluator"):
+      signal.signal(signal.SIGINT, signal.SIG_IGN)
     if num is not None:
       name += "-" + str(num)
-    with file_logger.FileLogger(config.path, name, config.quiet) as logger:
+    with file_logger.FileLogger(config.log_path or config.path, name, config.quiet) as logger:
       print("{} started".format(name))
       logger.print("{} started".format(name))
       try:
@@ -310,6 +328,21 @@ def update_checkpoint(
   return True
 
 
+def initial_checkpoint(logger, queue, model, az_evaluator):
+  """Workers must not play until the learner assigns their initial model."""
+  message = queue.get()
+  if message == "":
+    return False
+  if isinstance(message, dict):
+    from Algorithms.alpha_zero.checkpointing import restore_model
+    restore_model(model, message["snapshot"])
+  else:
+    model.load_checkpoint(message)
+  az_evaluator.clear_cache()
+  logger.print("Initial checkpoint loaded", message)
+  return True
+
+
 @watcher
 def actor(
     *,
@@ -323,6 +356,8 @@ def actor(
   model = _init_model_from_config(config)
   logger.print("Initializing bots")
   az_evaluator = evaluator_lib.AlphaZeroEvaluator(game, model)
+  if not initial_checkpoint(logger, queue, model, az_evaluator):
+    return
   bots = [
       _init_bot(config, game, az_evaluator, False),
       _init_bot(config, game, az_evaluator, False),
@@ -353,6 +388,8 @@ def evaluator(
   model = _init_model_from_config(config)
   logger.print("Initializing bots")
   az_evaluator = evaluator_lib.AlphaZeroEvaluator(game, model)
+  if not initial_checkpoint(logger, queue, model, az_evaluator):
+    return
   random_evaluator = mcts.RandomRolloutEvaluator()
 
   for game_num in itertools.count():
@@ -399,24 +436,23 @@ def learner(
     evaluators: list[spawn.Process],
     broadcast_fn: Callable,
     logger: Any,
+    restored_state=None,
 ) -> None:
   """A learner that consumes the replay buffer and trains the network."""
   logger.also_to_stdout = True
 
-  replay_buffer = buffer_lib.Buffer(config.replay_buffer_size)
+  replay_buffer = (restored_state[1] if restored_state else
+                   buffer_lib.Buffer(config.replay_buffer_size))
   learn_rate = config.replay_buffer_size // config.replay_buffer_reuse
   logger.print("Initializing model")
-  model = _init_model_from_config(config)
+  model = restored_state[0] if restored_state else _init_model_from_config(config)
   logger.print(
       f"Model type: {config.nn_model}({config.nn_width}, {config.nn_depth})"
   )
   logger.print("Model size:", model.num_trainable_variables, "variables")
 
-  save_path = model.save_checkpoint(0)
-  logger.print("Initial checkpoint:", save_path)
-  broadcast_fn(str(save_path))
-
-  data_log = data_logger.DataLoggerJsonLines(config.path, "learner", True)
+  data_log = data_logger.DataLoggerJsonLines(
+      config.path, "learner", True, append=bool(config.resume_snapshot))
 
   stage_count = config.eval_levels
   value_accuracies = [stats.BasicStats() for _ in range(stage_count)]
@@ -425,11 +461,24 @@ def learner(
   game_lengths_hist = stats.HistogramNumbered(game.max_game_length() + 1)
   outcomes = stats.HistogramNamed(["Player1", "Player2", "Draw"])
   # evaluation is yet on cpu
-  evals = [
+  evals = restored_state[2] if restored_state else [
       buffer_lib.Buffer(config.evaluation_window, force_cpu=True)
       for _ in range(config.eval_levels)
   ]
   total_trajectories = 0
+  completed_step = 0
+  from Algorithms.alpha_zero import checkpointing
+  if config.resume_snapshot:
+    saved = (restored_state[3] if restored_state else
+             checkpointing.restore_learner(config, model, replay_buffer, evals))
+    completed_step = saved["completed_step"]
+    total_trajectories = saved["total_trajectories"]
+    broadcast_fn({"snapshot": config.resume_snapshot})
+    logger.print("Resumed learner after step", completed_step,
+                 "with replay positions", len(replay_buffer))
+  else:
+    save_path = model.save_checkpoint(0)
+    broadcast_fn(str(save_path))
 
   def trajectory_generator():
     """Merge all the actor queues into a single generator."""
@@ -506,7 +555,7 @@ def learner(
     return save_path, losses
 
   last_time = time.time() - 60
-  for step in itertools.count(1):
+  for step in itertools.count(completed_step + 1):
     for value_accuracy in value_accuracies:
       value_accuracy.reset()
     for value_prediction in value_predictions:
@@ -534,6 +583,8 @@ def learner(
     )
 
     save_path, losses = learn(step)
+    from Algorithms.alpha_zero.evaluation import evaluate_round
+    evaluate_round(config, game, model, step)
 
     for eval_process in evaluators:
       while True:
@@ -547,6 +598,8 @@ def learner(
     batch_size_stats.add(1)
     data_log.write({
         "step": step,
+        "session_id": config.session_id,
+        "gradient_updates": int(model._state.step),
         "total_states": replay_buffer.total_seen,
         "states_per_s_actor": num_states / (config.actors * seconds),
         "total_trajectories": total_trajectories,
@@ -583,7 +636,11 @@ def learner(
     })
     logger.print()
 
-    if config.max_steps > 0 and step >= config.max_steps:
+    final = (config.max_steps > 0 and step >= config.max_steps) or _STOP_REQUESTED
+    if step % config.resume_checkpoint_freq == 0 or final:
+      checkpointing.save_snapshot(config, save_path, replay_buffer, evals,
+                                  step, total_trajectories)
+    if final:
       break
 
     broadcast_fn(str(save_path))
@@ -630,6 +687,19 @@ def alpha_zero(config: Config) -> None:
   with open(os.path.join(config.path, "config.json"), "w") as fp:
     fp.write(json.dumps(config.__dict__, indent=2, sort_keys=True) + "\n")
 
+  global _STOP_REQUESTED
+  _STOP_REQUESTED = False
+  restored_state = None
+  if config.resume_snapshot:
+    from Algorithms.alpha_zero import checkpointing
+    model = _init_model_from_config(config)
+    replay = buffer_lib.Buffer(config.replay_buffer_size)
+    evals = [buffer_lib.Buffer(config.evaluation_window, force_cpu=True)
+             for _ in range(config.eval_levels)]
+    saved = checkpointing.restore_learner(config, model, replay, evals)
+    restored_state = (model, replay, evals, saved)
+  previous_signal = signal.getsignal(signal.SIGINT)
+  signal.signal(signal.SIGINT, _request_stop)
   actors = [
       spawn.Process(actor, kwargs={"game": game, "config": config, "num": i})
       for i in range(config.actors)
@@ -653,6 +723,7 @@ def alpha_zero(config: Config) -> None:
         actors=actors,  # pylint: disable=missing-kwoa
         evaluators=evaluators,
         broadcast_fn=broadcast,
+        restored_state=restored_state,
     )
   except (KeyboardInterrupt, EOFError):
     print("Caught a KeyboardInterrupt, stopping early.")
@@ -667,3 +738,4 @@ def alpha_zero(config: Config) -> None:
         proc.join(JOIN_WAIT_DELAY)
     for proc in evaluators:
       proc.join()
+    signal.signal(signal.SIGINT, previous_signal)

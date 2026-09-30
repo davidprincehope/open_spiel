@@ -26,8 +26,8 @@ from open_spiel.python.utils import gfile
 class DataLoggerJsonLines:
   """Log data to a jsonl file."""
 
-  def __init__(self, path: str, name: str, flush=True):
-    self._fd = gfile.Open(os.path.join(path, name + ".jsonl"), "w")
+  def __init__(self, path: str, name: str, flush=True, append=False):
+    self._fd = gfile.Open(os.path.join(path, name + ".jsonl"), "a" if append else "w")
     self._flush = flush
     self._start_time = time.time()
 
