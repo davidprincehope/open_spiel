@@ -102,6 +102,24 @@ class Trajectory:
   returns: chex.Array
 
 
+def player_to_move_value_target(returns, current_player):
+  """Final result from the perspective recorded with a self-play state."""
+  return returns[current_player]
+
+
+def replay_examples(trajectory):
+  """Convert completed self-play states to aligned canonical replay records."""
+  for state in trajectory.states:
+    yield utils.TrainInput(
+        observation=jnp.asarray(state.observation, dtype=jnp.float32),
+        legals_mask=jnp.asarray(state.legals_mask, dtype=jnp.bool),
+        policy=jnp.asarray(state.policy, dtype=jnp.float32),
+        value=jnp.asarray(
+            player_to_move_value_target(trajectory.returns,
+                                        state.current_player), dtype=jnp.float32),
+    )
+
+
 @chex.dataclass(frozen=True)
 class Config:
   """A config for the model/experiment."""
@@ -439,8 +457,6 @@ def learner(
       game_lengths.add(len(trajectory.states))
       game_lengths_hist.add(len(trajectory.states))
 
-      # we learn from perspective of only the first player,
-      # rather than rotating
       game_outcome = trajectory.returns[0]
       if game_outcome > 0:
         outcomes.add(0)
@@ -449,15 +465,8 @@ def learner(
       else:
         outcomes.add(2)
 
-      for s in trajectory.states:
-        replay_buffer.append(
-            utils.TrainInput(
-                observation=jnp.asarray(s.observation, dtype=jnp.float32),
-                legals_mask=jnp.asarray(s.legals_mask, dtype=jnp.bool),
-                policy=jnp.asarray(s.policy, dtype=jnp.float32),
-                value=jnp.asarray(game_outcome, dtype=jnp.float32),
-            )
-        )
+      for example in replay_examples(trajectory):
+        replay_buffer.append(example)
 
       for stage in range(stage_count):
         # Scale for the length of the game

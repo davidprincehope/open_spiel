@@ -69,7 +69,10 @@ class AlphaZeroEvaluator(mcts.Evaluator):
   def evaluate(self, state: pyspiel.State) -> np.ndarray:
     """Returns a value for the given state."""
     value, _ = self._inference(state)
-    return np.array([value, -value])
+    # The canonical network value belongs to the player to move. OpenSpiel's
+    # MCTS expects a player-indexed return vector at this API boundary.
+    player = state.current_player()
+    return np.array([value, -value]) if player == 0 else np.array([-value, value])
 
   def prior(self, state: pyspiel.State) -> list[tuple[int, float]]:
     if state.is_chance_node():

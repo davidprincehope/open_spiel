@@ -201,6 +201,18 @@ class AlphaZeroModel(nn.Module):
   ) -> tuple[chex.Array, chex.Array]:
     # torso:
     x = observations
+    if self.model_type == "ayo_mlp":
+      if self.input_shape != (15, 1, 1) or self.output_size != 6:
+        raise ValueError("ayo_mlp requires 15 inputs and 6 actions")
+      x = observations.reshape(observations.shape[:-3] + (15,))
+      x = nn.relu(nn.Dense(256, name="trunk_1")(x))
+      x = nn.relu(nn.Dense(256, name="trunk_2")(x))
+      x = nn.relu(nn.Dense(256, name="trunk_3")(x))
+      policy_hidden = nn.relu(nn.Dense(128, name="policy_hidden")(x))
+      policy_logits = nn.Dense(6, name="policy_logits")(policy_hidden)
+      value_hidden = nn.relu(nn.Dense(64, name="value_hidden")(x))
+      value_out = nn.tanh(nn.Dense(1, name="value_output")(value_hidden))
+      return policy_logits, value_out.squeeze(-1)
     if self.model_type == "mlp":
       x = utils.flatten(observations)
       for _ in range(self.nn_depth):
@@ -245,7 +257,7 @@ class TrainState(training.train_state.TrainState):
 
 class Model:
   """Basic model class."""
-  valid_model_types = ["mlp", "conv2d", "resnet"]
+  valid_model_types = ["mlp", "conv2d", "resnet", "ayo_mlp"]
 
   def __init__(
       self,
@@ -304,6 +316,13 @@ class Model:
 
     while len(input_shape) < 3:
       input_shape = input_shape + (1,)
+
+    if model_type == "ayo_mlp" and (input_shape != (15, 1, 1)
+                                    or output_size != 6
+                                    or nn_width != 256 or nn_depth != 3):
+      raise ValueError("ayo_mlp requires input=15, actions=6, width=256, depth=3")
+    if model_type == "ayo_mlp" and decouple_weight_decay:
+      raise ValueError("ayo_mlp uses Adam with explicit weight-only L2")
 
     model = AlphaZeroModel(
         model_type=model_type,
@@ -370,7 +389,9 @@ class Model:
           policy_loss = optax.softmax_cross_entropy(
               policy_logits, policy_targets
           )
-          value_loss = optax.l2_loss(value_preds, value_targets)
+          value_loss = ((value_preds - value_targets) ** 2
+                        if model_type == "ayo_mlp"
+                        else optax.l2_loss(value_preds, value_targets))
 
           return (policy_loss, value_loss), new_model_state["batch_stats"]
 
