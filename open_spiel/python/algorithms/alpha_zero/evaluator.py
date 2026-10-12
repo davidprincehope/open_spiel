@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Modified for AlphaAyoOlopon: convert player-to-move values to player-indexed
+# returns for OpenSpiel MCTS.
+
 """An MCTS Evaluator for an AlphaZero model."""
 
 from typing import Any

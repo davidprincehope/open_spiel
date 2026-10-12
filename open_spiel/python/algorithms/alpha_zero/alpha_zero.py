@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Modified for AlphaAyoOlopon: canonical Ayo replay, resumable learner snapshots,
+# checkpoint broadcasts, and evaluation integration.
+
 """A basic AlphaZero implementation.
 
 This implements the AlphaZero training algorithm. It spawns N actors which feed

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Modified for AlphaAyoOlopon: support append-mode logging when resuming training.
+
 """Log data to a jsonl file."""
 
 import datetime

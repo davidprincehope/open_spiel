@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Modified for AlphaAyoOlopon: add the canonical Ayo policy/value MLP and its
+# mean-squared value loss.
+
 """An AlphaZero model with a policy and value heads using flax.linen."""
 
 import functools
